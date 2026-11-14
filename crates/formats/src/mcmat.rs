@@ -20,6 +20,10 @@ const FORMAT: &str = "craft-material";
 const VERSION: u32 = 1;
 /// Largest entry read (maps are at most 8192² × 16 bits, compressed).
 const MAX_ENTRY: u64 = 512 << 20;
+/// Most map entries one manifest may name (a material has at most nine usages).
+const MAX_MAPS: usize = 64;
+/// Largest total payload read from one `.mcmat`: maps and source together (audit: TextureCraft #4).
+const MAX_TOTAL: u64 = 1 << 30;
 const KIND: &str = "MaterialCraft material";
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -69,12 +73,17 @@ fn malformed(msg: impl Into<String>) -> FormatError {
 /// Read `.mcmat` bytes.
 pub fn read_mcmat(bytes: &[u8]) -> Result<PortableMaterial> {
     let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| malformed(e.to_string()))?;
+    let mut total = 0u64;
     let mut read = |name: &str| -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let f = z.by_name(name).map_err(|_| malformed(format!("{name} is missing")))?;
         f.take(MAX_ENTRY + 1).read_to_end(&mut out).map_err(|e| malformed(format!("{name}: {e}")))?;
         if out.len() as u64 > MAX_ENTRY {
             return Err(FormatError::TooLarge(name.to_string()));
+        }
+        total = total.saturating_add(out.len() as u64);
+        if total > MAX_TOTAL {
+            return Err(FormatError::TooLarge(format!("{KIND} payload (over {MAX_TOTAL} bytes)")));
         }
         Ok(out)
     };
@@ -84,6 +93,9 @@ pub fn read_mcmat(bytes: &[u8]) -> Result<PortableMaterial> {
     }
     if manifest.version > VERSION {
         return Err(FormatError::Unsupported(format!("{KIND} version {} (this version reads up to {VERSION})", manifest.version)));
+    }
+    if manifest.maps.len() > MAX_MAPS {
+        return Err(malformed(format!("{} maps, over the {MAX_MAPS} map limit", manifest.maps.len())));
     }
     let maps = manifest.maps.iter().map(|m| Ok((m.usage.clone(), read(&m.file)?))).collect::<Result<Vec<_>>>()?;
     let source = read(&manifest.source)?;
@@ -165,6 +177,22 @@ mod tests {
         assert_eq!(m.source, b"pkg");
         assert!(matches!(read_mcmat(&sample(2)), Err(FormatError::Unsupported(_))));
         assert!(read_mcmat(b"junk").is_err());
+    }
+
+    #[test]
+    fn an_unbounded_map_list_is_refused() {
+        let maps: Vec<_> = (0..=MAX_MAPS).map(|_| serde_json::json!({"usage": "baseColor", "file": "maps/baseColor.png"})).collect();
+        let manifest =
+            serde_json::json!({"format": FORMAT, "version": VERSION, "name": "n", "graph": "g", "size": [4, 4], "maps": maps, "source": "source.mcraft"});
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        z.start_file("material.json", o).unwrap();
+        z.write_all(manifest.to_string().as_bytes()).unwrap();
+        z.start_file("maps/baseColor.png", o).unwrap();
+        z.write_all(&mesh_map_png(4, 3, &[0.5; 48]).unwrap()).unwrap();
+        z.start_file("source.mcraft", o).unwrap();
+        z.write_all(b"pkg").unwrap();
+        assert!(read_mcmat(&z.finish().unwrap().into_inner()).is_err());
     }
 
     #[test]
